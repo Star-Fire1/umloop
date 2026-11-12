@@ -1,5 +1,5 @@
 // File: backend/umloopBackend.ts
-// Centralized Firebase Authentication & Firestore Backend Service Methods for UMLoop (KAN-49 to KAN-52)
+// Complete Firebase Auth & Firestore Backend Workflow for KAN-60
 
 import { initializeApp, getApps, getApp } from "firebase/app";
 import {
@@ -17,6 +17,7 @@ import {
   addDoc,
   onSnapshot,
   doc,
+  getDoc,
   updateDoc,
   query,
   where,
@@ -54,16 +55,14 @@ export interface RequestItem {
   owner_email: string;
   requester_uid: string;
   requester_email: string;
-  request_status: "Pending" | "Accepted" | "Rejected" | "Completed";
+  request_status: "Pending" | "Accepted" | "Rejected" | "Cancelled" | "Completed";
   is_test: boolean;
 }
 
-// 1. Eligibility Validation: Must end with @siswa.um.edu.my (KAN-49)
 export function isValidUmEmail(email: string): boolean {
   return email.trim().toLowerCase().endsWith("@siswa.um.edu.my");
 }
 
-// 2. Authentication Methods (KAN-49)
 export async function registerUmStudent(email: string, password: string) {
   if (!isValidUmEmail(email)) {
     throw new Error("Eligibility Error: Only @siswa.um.edu.my student emails are allowed to register.");
@@ -90,7 +89,6 @@ export function subscribeToAuthChanges(callback: (user: User | null) => void) {
   return onAuthStateChanged(auth, callback);
 }
 
-// 3. Listing Methods (KAN-50 & KAN-52)
 export async function createListing(
   user: User | null,
   title: string,
@@ -141,7 +139,7 @@ export function subscribeToListings(callback: (listings: ListingItem[], reuseCou
   });
 }
 
-// 4. Request Submission & Validation Methods (KAN-50)
+// Save requests against the correct listing + block self/duplicate/unavailable requests (KAN-60)
 export async function createPendingRequest(user: User | null, listing: ListingItem) {
   if (!user || !user.email) {
     throw new Error("Auth Error: Please sign in before requesting an item.");
@@ -153,7 +151,9 @@ export async function createPendingRequest(user: User | null, listing: ListingIt
     throw new Error("Invalid Request Blocked: You cannot request your own listing.");
   }
   if (listing.status !== "Available") {
-    throw new Error("Invalid Request Blocked: This item is no longer Available.");
+    throw new Error(
+      `Double-Reservation Blocked: This single-item listing is already ${listing.status} and cannot be reserved for another user.`
+    );
   }
 
   const dupQuery = query(
@@ -173,7 +173,7 @@ export async function createPendingRequest(user: User | null, listing: ListingIt
 
   if (hasDuplicate) {
     throw new Error(
-      "Repeated Submission Blocked: You already have an active Pending/Accepted request for this item."
+      "Repeated Submission Blocked: You already have an active Pending/Accepted request for this listing."
     );
   }
 
@@ -189,7 +189,6 @@ export async function createPendingRequest(user: User | null, listing: ListingIt
   });
 }
 
-// 5. Owner Incoming Request Dashboard & Status Transitions (KAN-51)
 export function subscribeToRequests(callback: (requests: RequestItem[]) => void) {
   return onSnapshot(collection(db, "requests"), (snapshot) => {
     const requests: RequestItem[] = [];
@@ -210,15 +209,46 @@ export function subscribeToRequests(callback: (requests: RequestItem[]) => void)
   });
 }
 
+// Owner Accept: Prevent the same single-item listing from being reserved for two people (KAN-60)
 export async function acceptIncomingRequest(requestId: string, listingId: string) {
+  const listingRef = doc(db, "listings", listingId);
+  const listingSnap = await getDoc(listingRef);
+
+  if (!listingSnap.exists()) {
+    throw new Error("Listing not found.");
+  }
+
+  const currentStatus = listingSnap.data().status;
+  if (currentStatus !== "Available") {
+    throw new Error(
+      `Single-Item Reservation Lock: Cannot accept this request because the listing is already '${currentStatus}' for another student.`
+    );
+  }
+
   await updateDoc(doc(db, "requests", requestId), { request_status: "Accepted" });
-  await updateDoc(doc(db, "listings", listingId), { status: "Reserved" });
+  await updateDoc(listingRef, { status: "Reserved" });
 }
 
+// Owner Reject (KAN-60)
 export async function rejectIncomingRequest(requestId: string) {
   await updateDoc(doc(db, "requests", requestId), { request_status: "Rejected" });
 }
 
+// Cancel Request / Failed Handover: Update availability back to Available after cancellation (KAN-60)
+export async function cancelRequestAndRestoreAvailability(
+  requestId: string,
+  listingId: string,
+  currentRequestStatus: string
+) {
+  await updateDoc(doc(db, "requests", requestId), { request_status: "Cancelled" });
+
+  // If the request had locked the item as Reserved, restore the listing back to Available
+  if (currentRequestStatus === "Accepted") {
+    await updateDoc(doc(db, "listings", listingId), { status: "Available" });
+  }
+}
+
+// Complete Handover: Update availability to Completed after handover completion (KAN-60)
 export async function completeItemHandover(requestId: string, listingId: string) {
   await updateDoc(doc(db, "requests", requestId), { request_status: "Completed" });
   await updateDoc(doc(db, "listings", listingId), { status: "Completed" });
