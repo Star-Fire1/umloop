@@ -16,6 +16,7 @@ import {
   subscribeToRequests,
   acceptIncomingRequest,
   rejectIncomingRequest,
+  cancelRequestAndRestoreAvailability,
   completeItemHandover,
 } from "../backend/umloopBackend";
 
@@ -24,7 +25,15 @@ interface FaqLog {
   answer: string;
   tokensUsed: number;
   latencyMs: number;
+  outcome: "SUCCESS" | "FAILURE_OUT_OF_SCOPE" | "FAILURE_USAGE_LIMIT" | "FAILURE_ERROR";
   mode: string;
+}
+
+const SESSION_QUERY_LIMIT = 5;
+
+function getErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error) return err.message;
+  return fallback;
 }
 
 export default function UMLoopHomePage() {
@@ -32,7 +41,7 @@ export default function UMLoopHomePage() {
   const [emailInput, setEmailInput] = useState("seller1@siswa.um.edu.my");
   const [passwordInput, setPasswordInput] = useState("123456");
 
-  const [titleInput, setTitleInput] = useState("Used Engineering Calculus Textbook");
+  const [titleInput, setTitleInput] = useState("Scientific Calculator Casio FX-570EX");
   const [categoryInput, setCategoryInput] = useState("Exchange");
   const [isTestInput, setIsTestInput] = useState("false");
 
@@ -45,7 +54,7 @@ export default function UMLoopHomePage() {
     isError: boolean;
   } | null>(null);
 
-  // KAN-53 AI FAQ State
+  // KAN-60 Bounded Chatbot State
   const [selectedFaq, setSelectedFaq] = useState("q1");
   const [customQuestion, setCustomQuestion] = useState("");
   const [faqLogs, setFaqLogs] = useState<FaqLog[]>([]);
@@ -74,13 +83,33 @@ export default function UMLoopHomePage() {
     setStatusMessage({ text, isError });
   };
 
+  // Quick helper to authenticate either of the two test users (KAN-60 Priority 1)
+  const handleQuickTestUserAuth = async (testEmail: string, roleLabel: string) => {
+    setEmailInput(testEmail);
+    setPasswordInput("123456");
+    try {
+      showBanner(`Authenticating ${roleLabel} (${testEmail})...`, false);
+      if (currentUser) {
+        await signOutUmStudent();
+      }
+      try {
+        await signInUmStudent(testEmail, "123456");
+      } catch {
+        await registerUmStudent(testEmail, "123456");
+      }
+      showBanner(`Authenticated as ${roleLabel}: ${testEmail}`, false);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Authentication failed"), true);
+    }
+  };
+
   const handleRegister = async () => {
     try {
       showBanner("Registering account...", false);
       await registerUmStudent(emailInput, passwordInput);
       showBanner(`Account registered and signed in as: ${emailInput}`, false);
-    } catch (err: any) {
-      showBanner(err.message || "Registration failed", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Registration failed"), true);
     }
   };
 
@@ -89,8 +118,8 @@ export default function UMLoopHomePage() {
       showBanner("Signing in...", false);
       await signInUmStudent(emailInput, passwordInput);
       showBanner(`Signed in successfully as: ${emailInput}`, false);
-    } catch (err: any) {
-      showBanner(err.message || "Sign-in failed", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Sign-in failed"), true);
     }
   };
 
@@ -104,8 +133,8 @@ export default function UMLoopHomePage() {
     try {
       await triggerVerificationEmail(currentUser);
       showBanner(`Verification email sent to ${currentUser.email}`, false);
-    } catch (err: any) {
-      showBanner(err.message || "Failed to send verification email", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Failed to send verification email"), true);
     }
   };
 
@@ -118,11 +147,11 @@ export default function UMLoopHomePage() {
         isTestInput === "true"
       );
       showBanner(
-        `Listing created successfully under signed-in user: ${currentUser?.email}`,
+        `Listing created under ${currentUser?.email} with status 'Available'.`,
         false
       );
-    } catch (err: any) {
-      showBanner(err.message || "Error creating listing", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error creating listing"), true);
     }
   };
 
@@ -130,29 +159,50 @@ export default function UMLoopHomePage() {
     try {
       await createPendingRequest(currentUser, item);
       showBanner(
-        `Pending request created successfully by ${currentUser?.email}`,
+        `Request saved against listing '${item.title}' (${item.id}) by ${currentUser?.email}.`,
         false
       );
-    } catch (err: any) {
-      showBanner(err.message || "Error creating request", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error creating request"), true);
     }
   };
 
   const handleAccept = async (req: RequestItem) => {
     try {
       await acceptIncomingRequest(req.id, req.listing_id);
-      showBanner("Request accepted! Listing status locked to Reserved.", false);
-    } catch (err: any) {
-      showBanner(err.message || "Error accepting request", true);
+      showBanner(
+        "Request Accepted! Single-item listing is now locked as 'Reserved' (preventing reservation by a second person).",
+        false
+      );
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error accepting request"), true);
     }
   };
 
   const handleReject = async (req: RequestItem) => {
     try {
       await rejectIncomingRequest(req.id);
-      showBanner("Request rejected.", false);
-    } catch (err: any) {
-      showBanner(err.message || "Error rejecting request", true);
+      showBanner("Request Rejected by owner.", false);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error rejecting request"), true);
+    }
+  };
+
+  const handleCancel = async (req: RequestItem) => {
+    try {
+      await cancelRequestAndRestoreAvailability(
+        req.id,
+        req.listing_id,
+        req.request_status
+      );
+      showBanner(
+        req.request_status === "Accepted"
+          ? "Request Cancelled! Listing availability automatically restored from 'Reserved' back to 'Available'."
+          : "Pending request Cancelled.",
+        false
+      );
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error cancelling request"), true);
     }
   };
 
@@ -160,11 +210,11 @@ export default function UMLoopHomePage() {
     try {
       await completeItemHandover(req.id, req.listing_id);
       showBanner(
-        "Handover completed! Both listing and request are now marked as Completed.",
+        "Handover Completed! Listing and request updated to 'Completed' and reuse counter incremented.",
         false
       );
-    } catch (err: any) {
-      showBanner(err.message || "Error completing handover", true);
+    } catch (err: unknown) {
+      showBanner(getErrorMessage(err, "Error completing handover"), true);
     }
   };
 
@@ -177,6 +227,7 @@ export default function UMLoopHomePage() {
         body: JSON.stringify({
           faqKey: selectedFaq,
           customQuestion: customQuestion.trim(),
+          sessionQueryCount: faqLogs.length,
         }),
       });
       const data = await res.json();
@@ -191,23 +242,25 @@ export default function UMLoopHomePage() {
     }
   };
 
+  const successfulFaqCount = faqLogs.filter((l) => l.outcome === "SUCCESS").length;
+  const failedFaqCount = faqLogs.filter((l) => l.outcome !== "SUCCESS").length;
   const totalTokensUsed = faqLogs.reduce((acc, log) => acc + log.tokensUsed, 0);
 
   return (
     <main
       style={{
         fontFamily: "Arial, sans-serif",
-        maxWidth: "920px",
+        maxWidth: "960px",
         margin: "24px auto",
         padding: "0 16px",
         color: "#1e293b",
       }}
     >
-      <h1 style={{ color: "#0f172a", marginBottom: "8px" }}>
-        UMLoop — Campus Resource Circulation Platform (KAN-44 Integrated)
+      <h1 style={{ color: "#0f172a", marginBottom: "6px" }}>
+        UMLoop — Integrated Handover Workflow & Bounded FAQ Chatbot (KAN-60)
       </h1>
       <p style={{ fontSize: "14px", color: "#475569", marginTop: 0 }}>
-        Next.js + Firebase Auth & Firestore + Server-Side AI FAQ Route Deployed on Vercel
+        Live Deployed Verification: Two-User Auth • Request Decisions • Single-Item Reservation Lock • Cancellation/Completion Updates • Bounded AI FAQ with Usage Limits
       </p>
 
       {statusMessage && (
@@ -222,11 +275,11 @@ export default function UMLoopHomePage() {
             border: `1px solid ${statusMessage.isError ? "#f87171" : "#4ade80"}`,
           }}
         >
-          {statusMessage.text}
+          <strong>System Feedback:</strong> {statusMessage.text}
         </div>
       )}
 
-      {/* Module 1: KAN-49 Authentication */}
+      {/* Module 1: Authenticate the Two Test Users */}
       <section
         style={{
           background: "#ffffff",
@@ -237,8 +290,60 @@ export default function UMLoopHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "18px" }}>
-          1. UM Student Authentication (KAN-49)
+          1. Authenticate the Two Test Users (@siswa.um.edu.my)
         </h2>
+        <div
+          style={{
+            background: "#f8fafc",
+            padding: "10px 12px",
+            borderRadius: "6px",
+            border: "1px solid #cbd5e1",
+            marginBottom: "14px",
+            display: "flex",
+            gap: "10px",
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
+          <span style={{ fontSize: "13px", fontWeight: "bold", color: "#334155" }}>
+            1-Click Test User Switcher:
+          </span>
+          <button
+            onClick={() =>
+              handleQuickTestUserAuth("seller1@siswa.um.edu.my", "Test User 1 (Item Owner)")
+            }
+            style={{
+              background: "#1d4ed8",
+              color: "#fff",
+              border: "none",
+              padding: "6px 12px",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontWeight: "bold",
+            }}
+          >
+            Login as Test User 1 (Owner: seller1@siswa.um.edu.my)
+          </button>
+          <button
+            onClick={() =>
+              handleQuickTestUserAuth("buyer1@siswa.um.edu.my", "Test User 2 (Requester)")
+            }
+            style={{
+              background: "#047857",
+              color: "#fff",
+              border: "none",
+              padding: "6px 12px",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontWeight: "bold",
+            }}
+          >
+            Login as Test User 2 (Requester: buyer1@siswa.um.edu.my)
+          </button>
+        </div>
+
         {!currentUser ? (
           <div>
             <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginBottom: "12px" }}>
@@ -280,28 +385,27 @@ export default function UMLoopHomePage() {
           </div>
         ) : (
           <div>
-            <p style={{ fontSize: "14px" }}>
-              Signed in as: <strong>{currentUser.email}</strong> | UID:{" "}
-              <code>{currentUser.uid}</code> | Email Verified:{" "}
-              <span>{currentUser.emailVerified ? "Yes" : "Pending (Active for prototype)"}</span>
+            <p style={{ fontSize: "14px", margin: "6px 0 12px" }}>
+              Active Authenticated Session: <strong>{currentUser.email}</strong> | UID:{" "}
+              <code>{currentUser.uid}</code>
             </p>
             <button
               onClick={handleVerifyEmail}
-              style={{ background: "#475569", color: "#fff", border: "none", padding: "8px 14px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold", marginRight: "8px" }}
+              style={{ background: "#475569", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold", marginRight: "8px" }}
             >
               Send Verification Email
             </button>
             <button
               onClick={handleSignOut}
-              style={{ background: "#dc2626", color: "#fff", border: "none", padding: "8px 14px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
+              style={{ background: "#dc2626", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
             >
-              Sign Out (Switch Account)
+              Sign Out
             </button>
           </div>
         )}
       </section>
 
-      {/* Module 2: KAN-50 & KAN-52 Create Listing */}
+      {/* Module 2: Create Listing & Reuse Counter */}
       <section
         style={{
           background: "#ffffff",
@@ -312,7 +416,7 @@ export default function UMLoopHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "18px" }}>
-          2. Create a Listing & Sustainability Counter (KAN-50 & KAN-52)
+          2. Create Single-Item Listing & Reuse Counter
         </h2>
         <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginBottom: "12px" }}>
           <div style={{ flex: 1, minWidth: "200px" }}>
@@ -367,7 +471,7 @@ export default function UMLoopHomePage() {
         </span>
       </section>
 
-      {/* Module 3: KAN-50 Available Listings */}
+      {/* Module 3: Listings & Preventing Double Reservation */}
       <section
         style={{
           background: "#ffffff",
@@ -378,7 +482,7 @@ export default function UMLoopHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "18px" }}>
-          3. Available Listings & Request Validation (KAN-50)
+          3. Listings & Single-Item Reservation Protection
         </h2>
         {listings.length === 0 ? (
           <p style={{ fontSize: "14px", color: "#64748b" }}>No listings found. Create one above!</p>
@@ -395,6 +499,8 @@ export default function UMLoopHomePage() {
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
+                flexWrap: "wrap",
+                gap: "10px",
               }}
             >
               <div>
@@ -402,14 +508,34 @@ export default function UMLoopHomePage() {
                 <span style={{ background: "#dbeafe", color: "#1e40af", padding: "2px 8px", borderRadius: "12px", fontSize: "12px", fontWeight: "bold", marginLeft: "6px" }}>
                   {item.category}
                 </span>
-                <span style={{ background: "#fef3c7", color: "#92400e", padding: "2px 8px", borderRadius: "12px", fontSize: "12px", fontWeight: "bold", marginLeft: "6px" }}>
+                <span
+                  style={{
+                    background:
+                      item.status === "Available"
+                        ? "#dcfce7"
+                        : item.status === "Reserved"
+                        ? "#fef3c7"
+                        : "#e2e8f0",
+                    color:
+                      item.status === "Available"
+                        ? "#166534"
+                        : item.status === "Reserved"
+                        ? "#92400e"
+                        : "#334155",
+                    padding: "2px 8px",
+                    borderRadius: "12px",
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    marginLeft: "6px",
+                  }}
+                >
                   Status: {item.status}
                 </span>
                 <span style={{ background: "#e2e8f0", color: "#334155", padding: "2px 8px", borderRadius: "12px", fontSize: "12px", fontWeight: "bold", marginLeft: "6px" }}>
                   is_test: {String(item.is_test)}
                 </span>
                 <div style={{ fontSize: "13px", color: "#64748b", marginTop: "4px" }}>
-                  Owner: {item.owner_email} | ID: <code>{item.id}</code>
+                  Owner: {item.owner_email} | Listing ID: <code>{item.id}</code>
                 </div>
               </div>
               <button
@@ -425,14 +551,16 @@ export default function UMLoopHomePage() {
                   fontWeight: "bold",
                 }}
               >
-                {item.status === "Available" ? "Request Item" : `Locked (${item.status})`}
+                {item.status === "Available"
+                  ? "Request This Listing"
+                  : `Locked (${item.status} — Cannot Double-Reserve)`}
               </button>
             </div>
           ))
         )}
       </section>
 
-      {/* Module 4: KAN-51 Incoming Requests */}
+      {/* Module 4: Owner Decisions (Accept / Reject) & Handover Updates (Cancel / Complete) */}
       <section
         style={{
           background: "#ffffff",
@@ -443,7 +571,7 @@ export default function UMLoopHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "18px" }}>
-          4. Incoming Requests & Owner Actions (KAN-51)
+          4. Request Decisions (Accept / Reject) & Availability Updates (Cancel / Complete)
         </h2>
         {requests.length === 0 ? (
           <p style={{ fontSize: "14px", color: "#64748b" }}>No requests recorded yet.</p>
@@ -453,6 +581,11 @@ export default function UMLoopHomePage() {
               currentUser?.email &&
                 req.owner_email &&
                 currentUser.email.toLowerCase() === req.owner_email.toLowerCase()
+            );
+            const isRequester = Boolean(
+              currentUser?.email &&
+                req.requester_email &&
+                currentUser.email.toLowerCase() === req.requester_email.toLowerCase()
             );
 
             return (
@@ -467,10 +600,12 @@ export default function UMLoopHomePage() {
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "10px",
                 }}
               >
                 <div>
-                  <strong>Item: {req.listing_title}</strong>{" "}
+                  <strong>Listing: {req.listing_title}</strong>{" "}
                   <span style={{ background: "#dbeafe", color: "#1e40af", padding: "2px 8px", borderRadius: "12px", fontSize: "12px", fontWeight: "bold", marginLeft: "6px" }}>
                     Request Status: {req.request_status}
                   </span>
@@ -479,14 +614,14 @@ export default function UMLoopHomePage() {
                     <code>{req.listing_id}</code>
                   </div>
                 </div>
-                <div>
-                  {isOwner && req.request_status === "Pending" ? (
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  {isOwner && req.request_status === "Pending" && (
                     <>
                       <button
                         onClick={() => handleAccept(req)}
-                        style={{ background: "#059669", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold", marginRight: "6px" }}
+                        style={{ background: "#059669", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
                       >
-                        Accept (Lock Item)
+                        Accept (Reserve Item)
                       </button>
                       <button
                         onClick={() => handleReject(req)}
@@ -495,16 +630,30 @@ export default function UMLoopHomePage() {
                         Reject
                       </button>
                     </>
-                  ) : isOwner && req.request_status === "Accepted" ? (
+                  )}
+
+                  {isOwner && req.request_status === "Accepted" && (
                     <button
                       onClick={() => handleComplete(req)}
                       style={{ background: "#2563eb", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
                     >
-                      Mark Handover Completed
+                      Confirm Handover Completed
                     </button>
-                  ) : (
+                  )}
+
+                  {(isOwner || isRequester) &&
+                    (req.request_status === "Pending" || req.request_status === "Accepted") && (
+                      <button
+                        onClick={() => handleCancel(req)}
+                        style={{ background: "#d97706", color: "#fff", border: "none", padding: "7px 12px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
+                      >
+                        Cancel Request (Restore Available)
+                      </button>
+                    )}
+
+                  {req.request_status !== "Pending" && req.request_status !== "Accepted" && (
                     <span style={{ fontSize: "12px", color: "#64748b" }}>
-                      {isOwner ? "Action finalized" : `Waiting for owner (${req.owner_email})`}
+                      Decision Finalized ({req.request_status})
                     </span>
                   )}
                 </div>
@@ -514,7 +663,7 @@ export default function UMLoopHomePage() {
         )}
       </section>
 
-      {/* Module 5: KAN-53 AI FAQ Assistant via Next.js Server Route */}
+      {/* Module 5: Bounded Chatbot Demonstration with Agreed Usage Limits */}
       <section
         style={{
           background: "#ffffff",
@@ -525,10 +674,43 @@ export default function UMLoopHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "18px" }}>
-          5. AI FAQ Feasibility Test via Server Route `/api/faq` (KAN-53)
+          5. Bounded FAQ Chatbot Demonstration (Approved FAQ Set & Usage Limits)
         </h2>
+
+        {/* Metrics Bar recording Successful Answers, Failures, and Usage */}
+        <div
+          style={{
+            display: "flex",
+            gap: "12px",
+            flexWrap: "wrap",
+            background: "#f8fafc",
+            padding: "10px 14px",
+            borderRadius: "6px",
+            border: "1px solid #cbd5e1",
+            marginBottom: "14px",
+            fontSize: "13px",
+          }}
+        >
+          <div>
+            Session Usage Limit:{" "}
+            <strong>
+              {faqLogs.length} / {SESSION_QUERY_LIMIT} queries
+            </strong>{" "}
+            (Max 300 tokens/reply)
+          </div>
+          <div style={{ color: "#166534" }}>
+            Successful Answers: <strong>{successfulFaqCount}</strong>
+          </div>
+          <div style={{ color: "#991b1b" }}>
+            Failures / Guardrail Refusals: <strong>{failedFaqCount}</strong>
+          </div>
+          <div>
+            Total Tokens Recorded: <strong>{totalTokensUsed}</strong>
+          </div>
+        </div>
+
         <label style={{ display: "block", fontWeight: "bold", fontSize: "13px", marginBottom: "6px" }}>
-          Select an Approved UMLoop FAQ Question:
+          Select from Approved UMLoop FAQ Set:
         </label>
         <select
           value={selectedFaq}
@@ -537,40 +719,42 @@ export default function UMLoopHomePage() {
         >
           <option value="q1">Q1: Who is eligible to register and trade on UMLoop?</option>
           <option value="q2">Q2: What item categories are supported on UMLoop?</option>
-          <option value="q3">Q3: How do item statuses (Available, Reserved, Completed) work during a handover?</option>
-          <option value="q4">Q4: Why can&apos;t I request my own listing or submit multiple requests for the same item?</option>
+          <option value="q3">Q3: How do item statuses (Available, Reserved, Completed) work during a handover or cancellation?</option>
+          <option value="q4">Q4: Why can&apos;t I request my own listing or reserve an already-reserved item?</option>
           <option value="q5">Q5: How does UMLoop measure campus sustainability and separate test data?</option>
         </select>
 
         <label style={{ display: "block", fontWeight: "bold", fontSize: "13px", marginBottom: "6px" }}>
-          Optional Custom Question (Test out-of-scope guardrail):
+          Optional Custom Question (Test out-of-scope failure recording):
         </label>
         <input
           type="text"
           value={customQuestion}
           onChange={(e) => setCustomQuestion(e.target.value)}
-          placeholder="Leave blank to use selected approved FAQ above, or type a custom question..."
+          placeholder="Leave blank to ask selected approved FAQ, or type an unapproved question (e.g., 'What is the weather in KL?')..."
           style={{ width: "100%", padding: "8px", border: "1px solid #cbd5e1", borderRadius: "4px", marginBottom: "10px" }}
         />
 
         <button
           onClick={handleRunFaq}
           disabled={faqLoading}
-          style={{ background: "#2563eb", color: "#fff", border: "none", padding: "8px 14px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}
+          style={{ background: "#2563eb", color: "#fff", border: "none", padding: "8px 14px", borderRadius: "4px", cursor: "pointer", fontWeight: "bold", marginRight: "8px" }}
         >
-          {faqLoading ? "Querying /api/faq..." : "Ask UMLoop AI Assistant"}
+          {faqLoading ? "Querying /api/faq..." : "Ask Bounded FAQ Chatbot"}
         </button>
-        <span style={{ fontSize: "13px", color: "#475569", marginLeft: "12px" }}>
-          Queries Run: <strong>{faqLogs.length}</strong> | Estimated Tokens:{" "}
-          <strong>{totalTokensUsed}</strong>
-        </span>
+        <button
+          onClick={() => setFaqLogs([])}
+          style={{ background: "#64748b", color: "#fff", border: "none", padding: "8px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "13px" }}
+        >
+          Reset Session Quota
+        </button>
 
         {faqLogs.map((log, index) => (
           <div
             key={index}
             style={{
-              borderLeft: "4px solid #2563eb",
-              background: "#f1f5f9",
+              borderLeft: `4px solid ${log.outcome === "SUCCESS" ? "#16a34a" : "#dc2626"}`,
+              background: log.outcome === "SUCCESS" ? "#f0fdf4" : "#fef2f2",
               padding: "10px 14px",
               borderRadius: "4px",
               marginTop: "12px",
@@ -578,17 +762,62 @@ export default function UMLoopHomePage() {
             }}
           >
             <div>
+              <span
+                style={{
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  padding: "2px 6px",
+                  borderRadius: "4px",
+                  background: log.outcome === "SUCCESS" ? "#dcfce7" : "#fee2e2",
+                  color: log.outcome === "SUCCESS" ? "#166534" : "#991b1b",
+                  marginRight: "8px",
+                }}
+              >
+                {log.outcome}
+              </span>
               <strong>Question:</strong> {log.question}
             </div>
-            <div style={{ marginTop: "4px" }}>
-              <strong>Answer:</strong> {log.answer}
+            <div style={{ marginTop: "6px" }}>
+              <strong>Response:</strong> {log.answer}
             </div>
             <div style={{ fontSize: "12px", color: "#475569", marginTop: "6px" }}>
-              Route: <code>{log.mode}</code> | Latency: <code>{log.latencyMs} ms</code> | Usage:{" "}
+              Mode: <code>{log.mode}</code> | Latency: <code>{log.latencyMs} ms</code> | Usage:{" "}
               <code>{log.tokensUsed} tokens</code>
             </div>
           </div>
         ))}
+      </section>
+
+      {/* Module 6: Document Known Limitations (KAN-60 Deliverable Requirement) */}
+      <section
+        style={{
+          background: "#f8fafc",
+          padding: "18px",
+          borderRadius: "8px",
+          border: "1px solid #cbd5e1",
+          marginBottom: "24px",
+          fontSize: "13px",
+          color: "#334155",
+        }}
+      >
+        <h2 style={{ marginTop: 0, fontSize: "16px", color: "#0f172a" }}>
+          6. Documented Known Limitations (KAN-60 Deployment Notes)
+        </h2>
+        <ul style={{ margin: 0, paddingLeft: "20px", lineHeight: "1.6" }}>
+          <li>
+            <strong>Prototype Email Verification Enforcement:</strong> While{" "}
+            <code>@siswa.um.edu.my</code> domain suffix checks and Firebase verification emails are active, unverified accounts are permitted to test listing/request workflows in the prototype environment so evaluators can test with synthetic student accounts (<code>seller1@siswa.um.edu.my</code>, <code>buyer1@siswa.um.edu.my</code>).
+          </li>
+          <li>
+            <strong>Single-Item Inventory Model:</strong> Each listing represents a single physical campus item (quantity = 1). Accepting one request immediately locks the listing status to <code>Reserved</code>; multi-quantity inventory pooling is out of scope for the current MVP.
+          </li>
+          <li>
+            <strong>Chatbot Scope & Session Quota:</strong> The AI FAQ assistant is strictly bounded to 5 approved UMLoop policy topics with a session cap of 5 queries and 300 tokens per response. Multi-turn conversational memory and open-ended general queries are intentionally blocked by guardrails.
+          </li>
+          <li>
+            <strong>Offline Handover Coordination:</strong> Physical item exchange occurs offline at designated UM campus locations (e.g., Central Library); in-app payment processing is excluded by design.
+          </li>
+        </ul>
       </section>
     </main>
   );
