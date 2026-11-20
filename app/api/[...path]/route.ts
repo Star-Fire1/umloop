@@ -291,12 +291,56 @@ async function dispatchOtpEmail(email: string, code: string): Promise<boolean> {
   return true;
 }
 
-// Strip private owner_email before sending listing to client
-function toPublicListing(listing: StoredListing, viewerEmail: string | null) {
-  const { owner_email, ...publicFields } = listing;
+// Normalize both new REST listings and legacy Firestore records into the full frontend Listing shape
+function toPublicListing(
+  listing: Partial<StoredListing> & { id: string; owner_uid?: string },
+  viewerEmail: string | null
+) {
+  const rawCat = String(listing.category || "Books");
+  const isUiCategory = (ALLOWED_CATEGORIES as readonly string[]).includes(rawCat);
+  const uiCategory = isUiCategory ? rawCat : "Tech";
+  const reuseCategory =
+    listing.reuse_category ||
+    ((ALLOWED_REUSE_CATEGORIES as readonly string[]).includes(rawCat)
+      ? rawCat
+      : "Affordable Resale");
+
+  const defaultImg =
+    "https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?auto=format&fit=crop&w=800&q=80";
+  const images =
+    Array.isArray(listing.images) && listing.images.length > 0
+      ? listing.images
+      : [listing.image || defaultImg];
+
+  const ownerEmail = String(listing.owner_email || "");
+
   return {
-    ...publicFields,
-    owner: Boolean(viewerEmail && owner_email.toLowerCase() === viewerEmail.toLowerCase()),
+    id: listing.id,
+    title: String(listing.title || "Campus Item"),
+    price: Number(listing.price ?? 0),
+    type:
+      listing.type ||
+      (reuseCategory === "Donation"
+        ? "donate"
+        : reuseCategory === "Exchange"
+        ? "exchange"
+        : "sell"),
+    category: uiCategory,
+    reuse_category: reuseCategory,
+    status: listing.status || "Available",
+    is_test: Boolean(listing.is_test),
+    is_paused: Boolean(listing.is_paused),
+    is_boosted: Boolean(listing.is_boosted),
+    owner: Boolean(
+      viewerEmail && ownerEmail && ownerEmail.toLowerCase() === viewerEmail.toLowerCase()
+    ),
+    condition: String(listing.condition || "Good"),
+    image: images[0],
+    images,
+    seller: String(listing.seller || "Verified UM student"),
+    location: String(listing.location || "Central Library"),
+    description: String(listing.description || "Available for campus handover."),
+    tagline: String(listing.tagline || "Ready for another semester"),
   };
 }
 
