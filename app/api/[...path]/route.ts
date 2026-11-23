@@ -1,24 +1,13 @@
 // File: app/api/[...path]/route.ts
-// Production-grade Next.js REST API for UMLoop
-// Fixes all findings in UMLoop_Backend_API_Complete_Review.docx + adds QR Product Boosting transactions
+// Production REST API using Firebase Admin SDK for atomic buyer receipt confirmation & global reuse counter
 
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "../../../backend/umloopBackend";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  query,
-  runTransaction,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  where,
-} from "firebase/firestore";
+import { FieldValue } from "firebase-admin/firestore";
+import { adminAuth, adminDb } from "../../../backend/firebaseAdmin";
 
 export interface Profile {
+  uid?: string;
   name: string;
   email: string;
   faculty: string;
@@ -40,6 +29,7 @@ interface StoredListing {
   is_paused: boolean;
   is_boosted: boolean;
   boosted_until: string | null;
+  owner_uid?: string;
   owner_email: string;
   condition: string;
   image: string;
@@ -53,9 +43,13 @@ interface StoredListing {
 
 export interface PickupRequest {
   id: string;
-  listingId: string;
+  listingId?: string;
+  listing_id?: string;
+  listing_title?: string;
+  owner_uid?: string;
   owner_email: string;
   person: string;
+  requester_uid?: string;
   requester_email: string;
   message: string;
   date: string;
@@ -116,15 +110,10 @@ const ALLOWED_REUSE_CATEGORIES = [
   "Affordable Resale",
   "Recyclable",
 ] as const;
-const ALLOWED_IMAGE_MIME_TYPES = [
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-];
-const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 2 MB limit
-const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
+const ALLOWED_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+const OTP_TTL_MS = 10 * 60 * 1000;
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 
 function getSessionSecret(): string {
@@ -139,7 +128,6 @@ function isValidUmEmail(email: string): boolean {
   return /^[^@\s]+@siswa\.um\.edu\.my$/i.test(email.trim());
 }
 
-// Restrict CORS strictly to approved frontend origins
 function getAllowedOrigin(req: NextRequest): string | null {
   const origin = req.headers.get("origin");
   if (!origin) return null;
@@ -178,7 +166,6 @@ function errorResponse(req: NextRequest, message: string, status: number): NextR
   return withCors(req, NextResponse.json({ message, error: message }, { status }));
 }
 
-// Create HMAC-SHA256 signed session token (eliminates unsigned cookie & header spoofing)
 function signSessionToken(email: string, sessionVersion: number): string {
   const payload = Buffer.from(
     JSON.stringify({
@@ -238,24 +225,60 @@ function setSessionCookie(req: NextRequest, res: NextResponse, token: string) {
   });
 }
 
-// Authenticate caller strictly from signed HTTP-only cookie + durable Firestore profile
+// Resolve authenticated caller from either Firebase ID Token (Bearer) or signed HTTP-only session cookie
 async function getAuthenticatedProfile(req: NextRequest): Promise<Profile | null> {
+  const authHeader = req.headers.get("authorization");
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const idToken = authHeader.slice(7).trim();
+    try {
+      const decoded = await adminAuth.verifyIdToken(idToken);
+      const email = String(decoded.email || "").toLowerCase();
+      if (!isValidUmEmail(email)) return null;
+
+      const snap = await adminDb.collection("profiles").doc(email).get();
+      const data = snap.exists ? snap.data() || {} : {};
+      return {
+        uid: decoded.uid,
+        name: String(data.name || decoded.name || email.split("@")[0]),
+        email,
+        faculty: String(data.faculty || "Faculty of Computer Science & IT"),
+        year: String(data.year || "Year 2"),
+        pickup: String(data.pickup || "Central Library"),
+        verified: true,
+        loggedIn: true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   const cookieVal = req.cookies.get("umloop_session")?.value;
   if (!cookieVal) return null;
 
   const verifiedToken = verifySessionToken(cookieVal);
   if (!verifiedToken) return null;
 
-  const snap = await getDoc(doc(db, "profiles", verifiedToken.email));
-  if (!snap.exists()) return null;
+  const snap = await adminDb.collection("profiles").doc(verifiedToken.email).get();
+  if (!snap.exists) return null;
 
-  const data = snap.data();
+  const data = snap.data() || {};
   const currentVersion = Number(data.sessionVersion || 1);
   if (currentVersion !== verifiedToken.v || data.loggedIn === false) {
     return null;
   }
 
+  let resolvedUid: string | undefined = data.uid;
+  if (!resolvedUid) {
+    try {
+      const userRecord = await adminAuth.getUserByEmail(verifiedToken.email);
+      resolvedUid = userRecord.uid;
+    } catch {
+      resolvedUid = undefined;
+    }
+  }
+
   return {
+    uid: resolvedUid,
     name: String(data.name || verifiedToken.email.split("@")[0]),
     email: verifiedToken.email,
     faculty: String(data.faculty || "Faculty of Computer Science & IT"),
@@ -266,7 +289,6 @@ async function getAuthenticatedProfile(req: NextRequest): Promise<Profile | null
   };
 }
 
-// Send OTP email via Resend API if configured, otherwise log securely on server
 async function dispatchOtpEmail(email: string, code: string): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   if (resendKey) {
@@ -286,12 +308,11 @@ async function dispatchOtpEmail(email: string, code: string): Promise<boolean> {
     return resp.ok;
   }
 
-  // Server log fallback when email provider key is not configured yet
   console.info(`[UMLoop OTP] Verification code for ${email}: ${code}`);
   return true;
 }
 
-// Normalize both new REST listings and legacy Firestore records into the full frontend Listing shape
+// Normalize both new REST listings and legacy Firestore records into full frontend shape without exposing owner_email
 function toPublicListing(
   listing: Partial<StoredListing> & { id: string; owner_uid?: string },
   viewerEmail: string | null
@@ -344,14 +365,12 @@ function toPublicListing(
   };
 }
 
-// Strip private owner_email before sending Wanted post to client
 function toPublicWanted(wanted: StoredWanted) {
   const { owner_email, ...publicFields } = wanted;
   void owner_email;
   return publicFields;
 }
 
-// Map StoredThread to exact frontend Thread contract (unread: number, messages[].byMe: boolean)
 function toFrontendThread(thread: StoredThread, viewerEmail: string) {
   const viewerLower = viewerEmail.toLowerCase();
   const otherEmail =
@@ -394,10 +413,10 @@ async function handleRequest(
         return errorResponse(req, "Only @siswa.um.edu.my student emails are eligible.", 403);
       }
 
-      const otpRef = doc(db, "otp_codes", email);
-      const existingSnap = await getDoc(otpRef);
-      if (existingSnap.exists()) {
-        const lastSentAt = Number(existingSnap.data().lastSentAt || 0);
+      const otpRef = adminDb.collection("otp_codes").doc(email);
+      const existingSnap = await otpRef.get();
+      if (existingSnap.exists) {
+        const lastSentAt = Number(existingSnap.data()?.lastSentAt || 0);
         if (Date.now() - lastSentAt < OTP_RESEND_COOLDOWN_MS) {
           return errorResponse(
             req,
@@ -408,7 +427,7 @@ async function handleRequest(
       }
 
       const code = String(crypto.randomInt(100000, 999999));
-      await setDoc(otpRef, {
+      await otpRef.set({
         email,
         code,
         expiresAt: Date.now() + OTP_TTL_MS,
@@ -437,13 +456,13 @@ async function handleRequest(
         return errorResponse(req, "Please enter a valid 6-digit verification code.", 400);
       }
 
-      const otpRef = doc(db, "otp_codes", email);
-      const otpSnap = await getDoc(otpRef);
-      if (!otpSnap.exists()) {
+      const otpRef = adminDb.collection("otp_codes").doc(email);
+      const otpSnap = await otpRef.get();
+      if (!otpSnap.exists) {
         return errorResponse(req, "No verification code requested for this email.", 400);
       }
 
-      const otpData = otpSnap.data();
+      const otpData = otpSnap.data() || {};
       if (otpData.used) {
         return errorResponse(req, "This verification code has already been used.", 400);
       }
@@ -456,16 +475,15 @@ async function handleRequest(
       }
 
       if (otpData.code !== code) {
-        await updateDoc(otpRef, { attempts: attempts + 1 });
+        await otpRef.update({ attempts: attempts + 1 });
         return errorResponse(req, "Incorrect verification code.", 401);
       }
 
-      // Consume OTP atomically (one-time use)
-      await updateDoc(otpRef, { used: true });
+      await otpRef.update({ used: true });
 
-      const profileRef = doc(db, "profiles", email);
-      const profileSnap = await getDoc(profileRef);
-      const existing = profileSnap.exists() ? profileSnap.data() : {};
+      const profileRef = adminDb.collection("profiles").doc(email);
+      const profileSnap = await profileRef.get();
+      const existing = profileSnap.exists ? profileSnap.data() || {} : {};
       const nextSessionVersion = Number(existing.sessionVersion || 0) + 1;
 
       const profile: Profile = {
@@ -478,7 +496,7 @@ async function handleRequest(
         loggedIn: true,
       };
 
-      await setDoc(profileRef, {
+      await profileRef.set({
         ...profile,
         sessionVersion: nextSessionVersion,
         updatedAt: new Date().toISOString(),
@@ -493,13 +511,13 @@ async function handleRequest(
     if (method === "POST" && routePath === "/auth/logout") {
       const session = await getAuthenticatedProfile(req);
       if (session) {
-        const profileRef = doc(db, "profiles", session.email);
-        const snap = await getDoc(profileRef);
+        const profileRef = adminDb.collection("profiles").doc(session.email);
+        const snap = await profileRef.get();
         const nextVersion = Number(snap.data()?.sessionVersion || 1) + 1;
-        await updateDoc(profileRef, {
-          loggedIn: false,
-          sessionVersion: nextVersion,
-        });
+        await profileRef.set(
+          { loggedIn: false, sessionVersion: nextVersion },
+          { merge: true }
+        );
       }
 
       const res = new NextResponse(null, { status: 204 });
@@ -525,60 +543,52 @@ async function handleRequest(
           year: body.year !== undefined ? String(body.year).trim() : session.year,
           pickup: body.pickup !== undefined ? String(body.pickup).trim() : session.pickup,
         };
-        await updateDoc(doc(db, "profiles", session.email), {
-          name: updated.name,
-          faculty: updated.faculty,
-          year: updated.year,
-          pickup: updated.pickup,
-          updatedAt: new Date().toISOString(),
-        });
+        await adminDb.collection("profiles").doc(session.email).set(
+          {
+            name: updated.name,
+            faculty: updated.faculty,
+            year: updated.year,
+            pickup: updated.pickup,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
         return withCors(req, NextResponse.json(updated, { status: 200 }));
       }
     }
 
     // =========================================================================
-    // 2. SAVED LISTINGS (Persistent in Firestore `saved_items`)
+    // 2. SAVED LISTINGS
     // =========================================================================
     if (method === "GET" && routePath === "/me/saved") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
-      const snap = await getDoc(doc(db, "saved_items", session.email));
-      const ids: string[] = snap.exists() ? snap.data().listingIds || [] : [];
+      const snap = await adminDb.collection("saved_items").doc(session.email).get();
+      const ids: string[] = snap.exists ? snap.data()?.listingIds || [] : [];
       return withCors(req, NextResponse.json(ids, { status: 200 }));
     }
 
     if (path.length === 3 && path[0] === "me" && path[1] === "saved") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const listingId = decodeURIComponent(path[2]);
-      const savedRef = doc(db, "saved_items", session.email);
+      const savedRef = adminDb.collection("saved_items").doc(session.email);
 
       if (method === "POST") {
-        const listingSnap = await getDoc(doc(db, "listings", listingId));
-        if (!listingSnap.exists()) {
+        const listingSnap = await adminDb.collection("listings").doc(listingId).get();
+        if (!listingSnap.exists) {
           return errorResponse(req, "Listing not found.", 404);
         }
-        await runTransaction(db, async (tx) => {
-          const s = await tx.get(savedRef);
-          const current: string[] = s.exists() ? s.data().listingIds || [] : [];
-          if (!current.includes(listingId)) {
-            current.push(listingId);
-          }
-          tx.set(savedRef, { listingIds: current });
-        });
+        await savedRef.set({ listingIds: FieldValue.arrayUnion(listingId) }, { merge: true });
         return withCors(req, new NextResponse(null, { status: 204 }));
       }
 
       if (method === "DELETE") {
-        await runTransaction(db, async (tx) => {
-          const s = await tx.get(savedRef);
-          const current: string[] = s.exists() ? s.data().listingIds || [] : [];
-          tx.set(savedRef, { listingIds: current.filter((id) => id !== listingId) });
-        });
+        await savedRef.set({ listingIds: FieldValue.arrayRemove(listingId) }, { merge: true });
         return withCors(req, new NextResponse(null, { status: 204 }));
       }
     }
 
     // =========================================================================
-    // 3. IMAGE UPLOADS (Strict MIME & size validation + hosted URL)
+    // 3. IMAGE UPLOADS
     // =========================================================================
     if (method === "POST" && routePath === "/uploads/listing-images") {
       if (!session) {
@@ -609,7 +619,6 @@ async function handleRequest(
       const bucket =
         process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET || "um-loop-test-1.firebasestorage.app";
 
-      // Upload to Firebase Storage REST endpoint for a permanent public HTTPS URL
       const uploadResp = await fetch(
         `https://firebasestorage.googleapis.com/v0/b/${bucket}/o?uploadType=media&name=${encodeURIComponent(
           fileName
@@ -639,15 +648,15 @@ async function handleRequest(
     }
 
     // =========================================================================
-    // 4. LISTINGS (Durable Firestore + Boosting sort + Privacy filtering)
+    // 4. LISTINGS
     // =========================================================================
     if (method === "GET" && routePath === "/listings") {
-      const snap = await getDocs(collection(db, "listings"));
+      const snap = await adminDb.collection("listings").get();
       const viewerEmail = session?.email || null;
-      const items: StoredListing[] = [];
+      const items: Array<Partial<StoredListing> & { id: string }> = [];
 
       snap.forEach((docSnap) => {
-        const d = docSnap.data() as StoredListing;
+        const d = docSnap.data() as Partial<StoredListing>;
         const isOwner = Boolean(
           viewerEmail && d.owner_email?.toLowerCase() === viewerEmail.toLowerCase()
         );
@@ -656,7 +665,6 @@ async function handleRequest(
         }
       });
 
-      // Sort boosted items to the top
       items.sort((a, b) => Number(Boolean(b.is_boosted)) - Number(Boolean(a.is_boosted)));
 
       return withCors(
@@ -676,9 +684,7 @@ async function handleRequest(
 
       const body = await req.json().catch(() => ({}));
       const title = String(body.title || "").trim();
-      if (!title) {
-        return errorResponse(req, "Listing title is required.", 400);
-      }
+      if (!title) return errorResponse(req, "Listing title is required.", 400);
 
       const type = body.type === "donate" ? "donate" : body.type === "exchange" ? "exchange" : "sell";
       const price = Number(body.price ?? 0);
@@ -717,10 +723,11 @@ async function handleRequest(
         category,
         reuse_category: reuseCategory,
         status: "Available",
-        is_test: false,
+        is_test: Boolean(body.is_test ?? false),
         is_paused: false,
         is_boosted: false,
         boosted_until: null,
+        owner_uid: session.uid,
         owner_email: session.email,
         condition: String(body.condition || "Good"),
         image: imagesArr[0],
@@ -732,7 +739,7 @@ async function handleRequest(
         created_at: new Date().toISOString(),
       };
 
-      await setDoc(doc(db, "listings", id), newListing);
+      await adminDb.collection("listings").doc(id).set(newListing);
       return withCors(
         req,
         NextResponse.json(toPublicListing(newListing, session.email), { status: 201 })
@@ -742,9 +749,9 @@ async function handleRequest(
     if (method === "PATCH" && path.length === 2 && path[0] === "listings") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const listingId = decodeURIComponent(path[1]);
-      const listingRef = doc(db, "listings", listingId);
-      const snap = await getDoc(listingRef);
-      if (!snap.exists()) return errorResponse(req, "Listing not found.", 404);
+      const listingRef = adminDb.collection("listings").doc(listingId);
+      const snap = await listingRef.get();
+      if (!snap.exists) return errorResponse(req, "Listing not found.", 404);
 
       const existing = { ...(snap.data() as StoredListing), id: snap.id };
       if (existing.owner_email.toLowerCase() !== session.email.toLowerCase()) {
@@ -781,14 +788,13 @@ async function handleRequest(
         is_paused: typeof body.is_paused === "boolean" ? body.is_paused : existing.is_paused,
       };
 
-      await setDoc(listingRef, updated);
+      await listingRef.set(updated, { merge: true });
       return withCors(
         req,
         NextResponse.json(toPublicListing(updated, session.email), { status: 200 })
       );
     }
 
-    // POST /listings/:id/withdraw — Atomically mark Removed & cancel active requests
     if (
       method === "POST" &&
       path.length === 3 &&
@@ -797,14 +803,11 @@ async function handleRequest(
     ) {
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const listingId = decodeURIComponent(path[1]);
-      const listingRef = doc(db, "listings", listingId);
+      const listingRef = adminDb.collection("listings").doc(listingId);
 
-      const reqQuery = query(collection(db, "requests"), where("listingId", "==", listingId));
-      const reqSnaps = await getDocs(reqQuery);
-
-      const updatedListing = await runTransaction(db, async (tx) => {
+      const updatedListing = await adminDb.runTransaction(async (tx) => {
         const lSnap = await tx.get(listingRef);
-        if (!lSnap.exists()) throw new Error("NOT_FOUND");
+        if (!lSnap.exists) throw new Error("NOT_FOUND");
         const listing = { ...(lSnap.data() as StoredListing), id: lSnap.id };
         if (listing.owner_email.toLowerCase() !== session.email.toLowerCase()) {
           throw new Error("FORBIDDEN");
@@ -813,15 +816,25 @@ async function handleRequest(
           throw new Error("CONFLICT_COMPLETED");
         }
 
+        const reqSnaps1 = await tx.get(
+          adminDb.collection("requests").where("listingId", "==", listingId)
+        );
+        const reqSnaps2 = await tx.get(
+          adminDb.collection("requests").where("listing_id", "==", listingId)
+        );
+
         listing.status = "Removed";
         tx.update(listingRef, { status: "Removed" });
 
-        reqSnaps.forEach((rDoc) => {
+        const seen = new Set<string>();
+        for (const rDoc of [...reqSnaps1.docs, ...reqSnaps2.docs]) {
+          if (seen.has(rDoc.id)) continue;
+          seen.add(rDoc.id);
           const rStatus = rDoc.data().request_status;
           if (rStatus === "Pending" || rStatus === "Accepted") {
             tx.update(rDoc.ref, { request_status: "Cancelled" });
           }
-        });
+        }
 
         return listing;
       });
@@ -832,7 +845,6 @@ async function handleRequest(
       );
     }
 
-    // POST /listings/:id/reset-reservation — Atomically reset Reserved -> Available & cancel Accepted request
     if (
       method === "POST" &&
       path.length === 3 &&
@@ -841,18 +853,11 @@ async function handleRequest(
     ) {
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const listingId = decodeURIComponent(path[1]);
-      const listingRef = doc(db, "listings", listingId);
+      const listingRef = adminDb.collection("listings").doc(listingId);
 
-      const reqQuery = query(
-        collection(db, "requests"),
-        where("listingId", "==", listingId),
-        where("request_status", "==", "Accepted")
-      );
-      const acceptedSnaps = await getDocs(reqQuery);
-
-      const updatedListing = await runTransaction(db, async (tx) => {
+      const updatedListing = await adminDb.runTransaction(async (tx) => {
         const lSnap = await tx.get(listingRef);
-        if (!lSnap.exists()) throw new Error("NOT_FOUND");
+        if (!lSnap.exists) throw new Error("NOT_FOUND");
         const listing = { ...(lSnap.data() as StoredListing), id: lSnap.id };
         if (listing.owner_email.toLowerCase() !== session.email.toLowerCase()) {
           throw new Error("FORBIDDEN");
@@ -861,12 +866,28 @@ async function handleRequest(
           throw new Error("CONFLICT_NOT_RESERVED");
         }
 
+        const reqSnaps1 = await tx.get(
+          adminDb
+            .collection("requests")
+            .where("listingId", "==", listingId)
+            .where("request_status", "==", "Accepted")
+        );
+        const reqSnaps2 = await tx.get(
+          adminDb
+            .collection("requests")
+            .where("listing_id", "==", listingId)
+            .where("request_status", "==", "Accepted")
+        );
+
         listing.status = "Available";
         tx.update(listingRef, { status: "Available" });
 
-        acceptedSnaps.forEach((rDoc) => {
+        const seen = new Set<string>();
+        for (const rDoc of [...reqSnaps1.docs, ...reqSnaps2.docs]) {
+          if (seen.has(rDoc.id)) continue;
+          seen.add(rDoc.id);
           tx.update(rDoc.ref, { request_status: "Cancelled" });
-        });
+        }
 
         return listing;
       });
@@ -878,16 +899,21 @@ async function handleRequest(
     }
 
     // =========================================================================
-    // 5. REQUESTS & TWO-PARTY HANDOVERS (Atomic Firestore Transactions)
+    // 5. REQUESTS & BUYER RECEIPT CONFIRMATION (Atomic Admin SDK Transactions)
     // =========================================================================
     if (method === "GET" && routePath === "/requests/mine") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
-      const snap = await getDocs(collection(db, "requests"));
+      const snap = await adminDb.collection("requests").get();
       const mine: PickupRequest[] = [];
       const userEmail = session.email.toLowerCase();
 
       snap.forEach((d) => {
-        const r = { ...(d.data() as PickupRequest), id: d.id };
+        const raw = d.data() as PickupRequest;
+        const r: PickupRequest = {
+          ...raw,
+          id: d.id,
+          listingId: raw.listingId || raw.listing_id || "",
+        };
         if (
           r.requester_email?.toLowerCase() === userEmail ||
           r.owner_email?.toLowerCase() === userEmail
@@ -916,35 +942,39 @@ async function handleRequest(
         }
       }
 
-      // Deterministic lock document ID prevents simultaneous duplicate requests by same user
       const lockId = `${listingId}_${session.email.toLowerCase()}`;
-      const lockRef = doc(db, "request_locks", lockId);
-      const listingRef = doc(db, "listings", listingId);
+      const lockRef = adminDb.collection("request_locks").doc(lockId);
+      const listingRef = adminDb.collection("listings").doc(listingId);
       const newReqId = crypto.randomUUID();
-      const newReqRef = doc(db, "requests", newReqId);
+      const newReqRef = adminDb.collection("requests").doc(newReqId);
 
-      const createdRequest = await runTransaction(db, async (tx) => {
-        const lSnap = await tx.get(listingRef);
-        if (!lSnap.exists()) throw new Error("NOT_FOUND");
+      const createdRequest = await adminDb.runTransaction(async (tx) => {
+        const [lSnap, lockSnap] = await Promise.all([tx.get(listingRef), tx.get(lockRef)]);
+        if (!lSnap.exists) throw new Error("NOT_FOUND");
         const listing = lSnap.data() as StoredListing;
 
-        if (listing.owner_email.toLowerCase() === session.email.toLowerCase()) {
+        if (
+          listing.owner_email?.toLowerCase() === session.email.toLowerCase() ||
+          (session.uid && listing.owner_uid && listing.owner_uid === session.uid)
+        ) {
           throw new Error("SELF_REQUEST");
         }
         if (listing.status !== "Available" || listing.is_paused) {
           throw new Error("UNAVAILABLE");
         }
-
-        const lockSnap = await tx.get(lockRef);
-        if (lockSnap.exists() && lockSnap.data().active === true) {
+        if (lockSnap.exists && lockSnap.data()?.active === true) {
           throw new Error("DUPLICATE_REQUEST");
         }
 
         const reqRecord: PickupRequest = {
           id: newReqId,
           listingId,
+          listing_id: listingId,
+          listing_title: listing.title,
+          owner_uid: listing.owner_uid,
           owner_email: listing.owner_email,
           person: session.name || "Verified UM student",
+          requester_uid: session.uid,
           requester_email: session.email,
           message: String(body.message || "Hi, I would like to request this item."),
           date: body.pickup_at
@@ -953,7 +983,7 @@ async function handleRequest(
           pickup_at: body.pickup_at ?? null,
           location: String(body.pickup_location || body.location || listing.location),
           request_status: "Pending",
-          is_test: false,
+          is_test: Boolean(body.is_test ?? false),
           confirmed_by_requester: false,
           confirmed_by_owner: false,
         };
@@ -970,22 +1000,25 @@ async function handleRequest(
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const reqId = decodeURIComponent(path[1]);
       const action = path[2];
-      const reqRef = doc(db, "requests", reqId);
+      const reqRef = adminDb.collection("requests").doc(reqId);
 
       if (action === "accept") {
-        const result = await runTransaction(db, async (tx) => {
+        const result = await adminDb.runTransaction(async (tx) => {
           const rSnap = await tx.get(reqRef);
-          if (!rSnap.exists()) throw new Error("NOT_FOUND");
+          if (!rSnap.exists) throw new Error("NOT_FOUND");
           const reqData = { ...(rSnap.data() as PickupRequest), id: rSnap.id };
+          const targetListingId = String(reqData.listingId || reqData.listing_id || "");
 
-          const listingRef = doc(db, "listings", reqData.listingId);
+          const listingRef = adminDb.collection("listings").doc(targetListingId);
           const lSnap = await tx.get(listingRef);
-          if (!lSnap.exists()) throw new Error("NOT_FOUND");
+          if (!lSnap.exists) throw new Error("NOT_FOUND");
           const listingData = { ...(lSnap.data() as StoredListing), id: lSnap.id };
 
-          if (listingData.owner_email.toLowerCase() !== session.email.toLowerCase()) {
-            throw new Error("FORBIDDEN");
-          }
+          const isOwner =
+            listingData.owner_email?.toLowerCase() === session.email.toLowerCase() ||
+            Boolean(session.uid && listingData.owner_uid === session.uid);
+          if (!isOwner) throw new Error("FORBIDDEN");
+
           if (listingData.status !== "Available" || reqData.request_status !== "Pending") {
             throw new Error("CONFLICT");
           }
@@ -1004,52 +1037,58 @@ async function handleRequest(
       }
 
       if (action === "reject") {
-        const updatedReq = await runTransaction(db, async (tx) => {
+        const updatedReq = await adminDb.runTransaction(async (tx) => {
           const rSnap = await tx.get(reqRef);
-          if (!rSnap.exists()) throw new Error("NOT_FOUND");
+          if (!rSnap.exists) throw new Error("NOT_FOUND");
           const reqData = { ...(rSnap.data() as PickupRequest), id: rSnap.id };
+          const targetListingId = String(reqData.listingId || reqData.listing_id || "");
 
-          const lSnap = await tx.get(doc(db, "listings", reqData.listingId));
-          if (!lSnap.exists()) throw new Error("NOT_FOUND");
+          const lSnap = await tx.get(adminDb.collection("listings").doc(targetListingId));
+          if (!lSnap.exists) throw new Error("NOT_FOUND");
           const listingData = lSnap.data() as StoredListing;
 
-          if (listingData.owner_email.toLowerCase() !== session.email.toLowerCase()) {
-            throw new Error("FORBIDDEN");
-          }
-          // Only Pending requests may be rejected
+          const isOwner =
+            listingData.owner_email?.toLowerCase() === session.email.toLowerCase() ||
+            Boolean(session.uid && listingData.owner_uid === session.uid);
+          if (!isOwner) throw new Error("FORBIDDEN");
+
           if (reqData.request_status !== "Pending") {
             throw new Error("CONFLICT_NOT_PENDING");
           }
 
           reqData.request_status = "Rejected";
           tx.update(reqRef, { request_status: "Rejected" });
-          const lockRef = doc(
-            db,
-            "request_locks",
-            `${reqData.listingId}_${reqData.requester_email.toLowerCase()}`
-          );
-          tx.set(lockRef, { active: false });
+          if (reqData.requester_email) {
+            const lockRef = adminDb
+              .collection("request_locks")
+              .doc(`${targetListingId}_${reqData.requester_email.toLowerCase()}`);
+            tx.set(lockRef, { active: false }, { merge: true });
+          }
           return reqData;
         });
         return withCors(req, NextResponse.json(updatedReq, { status: 200 }));
       }
 
       if (action === "cancel") {
-        const result = await runTransaction(db, async (tx) => {
+        const result = await adminDb.runTransaction(async (tx) => {
           const rSnap = await tx.get(reqRef);
-          if (!rSnap.exists()) throw new Error("NOT_FOUND");
+          if (!rSnap.exists) throw new Error("NOT_FOUND");
           const reqData = { ...(rSnap.data() as PickupRequest), id: rSnap.id };
+          const targetListingId = String(reqData.listingId || reqData.listing_id || "");
 
-          const listingRef = doc(db, "listings", reqData.listingId);
+          const listingRef = adminDb.collection("listings").doc(targetListingId);
           const lSnap = await tx.get(listingRef);
-          if (!lSnap.exists()) throw new Error("NOT_FOUND");
+          if (!lSnap.exists) throw new Error("NOT_FOUND");
           const listingData = { ...(lSnap.data() as StoredListing), id: lSnap.id };
 
-          const isOwner = listingData.owner_email.toLowerCase() === session.email.toLowerCase();
-          const isRequester = reqData.requester_email.toLowerCase() === session.email.toLowerCase();
+          const isOwner =
+            listingData.owner_email?.toLowerCase() === session.email.toLowerCase() ||
+            Boolean(session.uid && listingData.owner_uid === session.uid);
+          const isRequester =
+            reqData.requester_email?.toLowerCase() === session.email.toLowerCase() ||
+            Boolean(session.uid && reqData.requester_uid === session.uid);
           if (!isOwner && !isRequester) throw new Error("FORBIDDEN");
 
-          // Never cancel Completed, Rejected, or already Cancelled requests
           if (
             reqData.request_status !== "Pending" &&
             reqData.request_status !== "Accepted"
@@ -1061,14 +1100,13 @@ async function handleRequest(
           reqData.request_status = "Cancelled";
           tx.update(reqRef, { request_status: "Cancelled" });
 
-          const lockRef = doc(
-            db,
-            "request_locks",
-            `${reqData.listingId}_${reqData.requester_email.toLowerCase()}`
-          );
-          tx.set(lockRef, { active: false });
+          if (reqData.requester_email) {
+            const lockRef = adminDb
+              .collection("request_locks")
+              .doc(`${targetListingId}_${reqData.requester_email.toLowerCase()}`);
+            tx.set(lockRef, { active: false }, { merge: true });
+          }
 
-          // Restore Available only if listing is Reserved (never revive Removed)
           if (wasAccepted && listingData.status === "Reserved") {
             listingData.status = "Available";
             tx.update(listingRef, { status: "Available" });
@@ -1082,46 +1120,116 @@ async function handleRequest(
         return withCors(req, NextResponse.json(result, { status: 200 }));
       }
 
-      if (action === "confirm-handover") {
-        const result = await runTransaction(db, async (tx) => {
+      // Buyer Receipt Confirmation & Handover Completion (Atomically increments statistics/global.reuseCount)
+      if (action === "confirm-receipt" || action === "confirm-handover") {
+        const result = await adminDb.runTransaction(async (tx) => {
           const rSnap = await tx.get(reqRef);
-          if (!rSnap.exists()) throw new Error("NOT_FOUND");
+          if (!rSnap.exists) throw new Error("NOT_FOUND");
           const reqData = { ...(rSnap.data() as PickupRequest), id: rSnap.id };
+          const targetListingId = String(reqData.listingId || reqData.listing_id || "");
 
-          const listingRef = doc(db, "listings", reqData.listingId);
-          const lSnap = await tx.get(listingRef);
-          if (!lSnap.exists()) throw new Error("NOT_FOUND");
-          const listingData = { ...(lSnap.data() as StoredListing), id: lSnap.id };
-
-          const isOwner = listingData.owner_email.toLowerCase() === session.email.toLowerCase();
-          const isRequester = reqData.requester_email.toLowerCase() === session.email.toLowerCase();
-          if (!isOwner && !isRequester) throw new Error("FORBIDDEN");
-
-          if (reqData.request_status !== "Accepted" || listingData.status !== "Reserved") {
+          // Prevent duplicate completion & duplicate counter increments
+          if (reqData.request_status === "Completed") {
+            throw new Error("ALREADY_COMPLETED");
+          }
+          if (reqData.request_status !== "Accepted") {
             throw new Error("CONFLICT_HANDOVER");
           }
 
-          if (isOwner) reqData.confirmed_by_owner = true;
-          if (isRequester) reqData.confirmed_by_requester = true;
+          const listingRef = adminDb.collection("listings").doc(targetListingId);
+          const statsRef = adminDb.collection("statistics").doc("global");
+          const [lSnap, statsSnap] = await Promise.all([
+            tx.get(listingRef),
+            tx.get(statsRef),
+          ]);
+          if (!lSnap.exists) throw new Error("NOT_FOUND");
+          const listingData = { ...(lSnap.data() as StoredListing), id: lSnap.id };
 
-          // Complete atomically ONLY after BOTH parties confirm
-          if (reqData.confirmed_by_owner && reqData.confirmed_by_requester) {
-            reqData.request_status = "Completed";
-            listingData.status = "Completed";
-            tx.update(listingRef, { status: "Completed" });
-            const lockRef = doc(
-              db,
-              "request_locks",
-              `${reqData.listingId}_${reqData.requester_email.toLowerCase()}`
-            );
-            tx.set(lockRef, { active: false });
+          if (listingData.status !== "Reserved") {
+            throw new Error("CONFLICT_HANDOVER");
           }
 
-          tx.update(reqRef, {
-            confirmed_by_owner: reqData.confirmed_by_owner,
-            confirmed_by_requester: reqData.confirmed_by_requester,
-            request_status: reqData.request_status,
-          });
+          // Validate authenticated buyer's UID (and email fallback)
+          const isBuyerByUid = Boolean(
+            session.uid && reqData.requester_uid && session.uid === reqData.requester_uid
+          );
+          const isBuyerByEmail = Boolean(
+            reqData.requester_email &&
+              session.email.toLowerCase() === reqData.requester_email.toLowerCase()
+          );
+          const isBuyer = isBuyerByUid || isBuyerByEmail;
+
+          const isOwner = Boolean(
+            (session.uid && listingData.owner_uid && session.uid === listingData.owner_uid) ||
+              (listingData.owner_email &&
+                session.email.toLowerCase() === listingData.owner_email.toLowerCase())
+          );
+
+          if (action === "confirm-receipt" && !isBuyer) {
+            throw new Error("FORBIDDEN_BUYER_ONLY");
+          }
+          if (!isBuyer && !isOwner) {
+            throw new Error("FORBIDDEN");
+          }
+
+          if (isOwner) reqData.confirmed_by_owner = true;
+          if (isBuyer) reqData.confirmed_by_requester = true;
+
+          // Transition to Completed when buyer confirms receipt (or both parties confirm in two-party mode)
+          const shouldComplete =
+            action === "confirm-receipt"
+              ? isBuyer
+              : Boolean(reqData.confirmed_by_owner && reqData.confirmed_by_requester);
+
+          if (shouldComplete) {
+            reqData.request_status = "Completed";
+            listingData.status = "Completed";
+
+            tx.update(reqRef, {
+              confirmed_by_owner: Boolean(reqData.confirmed_by_owner),
+              confirmed_by_requester: true,
+              request_status: "Completed",
+              completed_by_uid: session.uid || reqData.requester_uid || null,
+              completed_at: FieldValue.serverTimestamp(),
+            });
+
+            tx.update(listingRef, {
+              status: "Completed",
+              completed_at: FieldValue.serverTimestamp(),
+            });
+
+            if (reqData.requester_email) {
+              const lockRef = adminDb
+                .collection("request_locks")
+                .doc(`${targetListingId}_${reqData.requester_email.toLowerCase()}`);
+              tx.set(lockRef, { active: false }, { merge: true });
+            }
+
+            // Atomically increment statistics/global.reuseCount ONLY for genuine non-test Requests
+            if (reqData.is_test === false) {
+              const categoryKey = String(
+                listingData.reuse_category || listingData.category || "Exchange"
+              );
+              if (!statsSnap.exists) {
+                tx.set(statsRef, {
+                  reuseCount: 1,
+                  [categoryKey]: 1,
+                  updatedAt: FieldValue.serverTimestamp(),
+                });
+              } else {
+                tx.update(statsRef, {
+                  reuseCount: FieldValue.increment(1),
+                  [categoryKey]: FieldValue.increment(1),
+                  updatedAt: FieldValue.serverTimestamp(),
+                });
+              }
+            }
+          } else {
+            tx.update(reqRef, {
+              confirmed_by_owner: Boolean(reqData.confirmed_by_owner),
+              confirmed_by_requester: Boolean(reqData.confirmed_by_requester),
+            });
+          }
 
           return {
             listing: toPublicListing(listingData, session.email),
@@ -1133,15 +1241,14 @@ async function handleRequest(
     }
 
     // =========================================================================
-    // 6. CHATS & INBOX (Participant-authorized, aligned with frontend Thread type)
+    // 6. CHATS & INBOX
     // =========================================================================
     if (method === "GET" && routePath === "/threads") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
-      const q = query(
-        collection(db, "threads"),
-        where("participants", "array-contains", session.email.toLowerCase())
-      );
-      const snap = await getDocs(q);
+      const snap = await adminDb
+        .collection("threads")
+        .where("participants", "array-contains", session.email.toLowerCase())
+        .get();
       const threads = snap.docs.map((d) =>
         toFrontendThread({ ...(d.data() as StoredThread), id: d.id }, session.email)
       );
@@ -1160,10 +1267,10 @@ async function handleRequest(
       const text = String(body.text || body.message || "").trim();
       if (!text) return errorResponse(req, "Message text cannot be empty.", 400);
 
-      const threadRef = doc(db, "threads", threadId);
-      const updated = await runTransaction(db, async (tx) => {
+      const threadRef = adminDb.collection("threads").doc(threadId);
+      const updated = await adminDb.runTransaction(async (tx) => {
         const snap = await tx.get(threadRef);
-        if (!snap.exists()) throw new Error("NOT_FOUND");
+        if (!snap.exists) throw new Error("NOT_FOUND");
         const thread = { ...(snap.data() as StoredThread), id: snap.id };
         const caller = session.email.toLowerCase();
 
@@ -1203,11 +1310,11 @@ async function handleRequest(
     ) {
       if (!session) return errorResponse(req, "Authentication required.", 401);
       const threadId = decodeURIComponent(path[1]);
-      const threadRef = doc(db, "threads", threadId);
+      const threadRef = adminDb.collection("threads").doc(threadId);
 
-      await runTransaction(db, async (tx) => {
+      await adminDb.runTransaction(async (tx) => {
         const snap = await tx.get(threadRef);
-        if (!snap.exists()) throw new Error("NOT_FOUND");
+        if (!snap.exists) throw new Error("NOT_FOUND");
         const thread = snap.data() as StoredThread;
         const caller = session.email.toLowerCase();
         if (!thread.participants.map((p) => p.toLowerCase()).includes(caller)) {
@@ -1220,10 +1327,10 @@ async function handleRequest(
     }
 
     // =========================================================================
-    // 7. WANTED POSTS (Aligned schema + Per-Offerer Isolated Chat Threads)
+    // 7. WANTED POSTS
     // =========================================================================
     if (method === "GET" && routePath === "/wanted") {
-      const snap = await getDocs(collection(db, "wanted_posts"));
+      const snap = await adminDb.collection("wanted_posts").get();
       const posts = snap.docs.map((d) =>
         toPublicWanted({ ...(d.data() as StoredWanted), id: d.id })
       );
@@ -1259,7 +1366,7 @@ async function handleRequest(
         owner_email: session.email,
       };
 
-      await setDoc(doc(db, "wanted_posts", id), post);
+      await adminDb.collection("wanted_posts").doc(id).set(post);
       return withCors(req, NextResponse.json(toPublicWanted(post), { status: 201 }));
     }
 
@@ -1273,8 +1380,8 @@ async function handleRequest(
         return errorResponse(req, "Verified UM student account required.", 401);
       }
       const wantedId = decodeURIComponent(path[1]);
-      const wantedSnap = await getDoc(doc(db, "wanted_posts", wantedId));
-      if (!wantedSnap.exists()) {
+      const wantedSnap = await adminDb.collection("wanted_posts").doc(wantedId).get();
+      if (!wantedSnap.exists) {
         return errorResponse(req, "Wanted post not found.", 404);
       }
 
@@ -1290,20 +1397,19 @@ async function handleRequest(
       const offerText = String(body.message || "Hi! I have this item available for you.").trim();
       if (!offerText) return errorResponse(req, "Offer message cannot be empty.", 400);
 
-      // Separate isolated thread per (wantedId + offererEmail)
       const pairHash = crypto
         .createHash("sha256")
         .update(`${wantedId}:${offererEmail}`)
         .digest("hex")
         .slice(0, 16);
       const threadId = `thread-wanted-${pairHash}`;
-      const threadRef = doc(db, "threads", threadId);
+      const threadRef = adminDb.collection("threads").doc(threadId);
 
-      const frontendThread = await runTransaction(db, async (tx) => {
+      const frontendThread = await adminDb.runTransaction(async (tx) => {
         const tSnap = await tx.get(threadRef);
         let thread: StoredThread;
 
-        if (tSnap.exists()) {
+        if (tSnap.exists) {
           thread = { ...(tSnap.data() as StoredThread), id: tSnap.id };
         } else {
           thread = {
@@ -1338,40 +1444,32 @@ async function handleRequest(
     }
 
     // =========================================================================
-    // 8. REUSE METRICS (Authoritative Firestore count)
+    // 8. REUSE METRICS (Reads single `statistics/global` counter doc)
     // =========================================================================
     if (method === "GET" && routePath === "/metrics/reuse") {
-      const counts: Record<"Exchange" | "Donation" | "Affordable Resale" | "Recyclable", number> = {
-        Exchange: 0,
-        Donation: 0,
-        "Affordable Resale": 0,
-        Recyclable: 0,
-      };
+      const statsSnap = await adminDb.collection("statistics").doc("global").get();
+      const data = statsSnap.exists ? statsSnap.data() || {} : {};
+      const globalCount = Number(data.reuseCount ?? 0);
 
-      const snap = await getDocs(collection(db, "listings"));
-      snap.forEach((docSnap) => {
-        const data = docSnap.data();
-        if (data.status === "Completed" && data.is_test === false) {
-          const cat = (data.reuse_category || data.category) as keyof typeof counts;
-          if (cat in counts) {
-            counts[cat] += 1;
-          }
-        }
-      });
+      const counts: Record<"Exchange" | "Donation" | "Affordable Resale" | "Recyclable", number> = {
+        Exchange: Number(data.Exchange ?? globalCount),
+        Donation: Number(data.Donation ?? 0),
+        "Affordable Resale": Number(data["Affordable Resale"] ?? 0),
+        Recyclable: Number(data.Recyclable ?? 0),
+      };
 
       return withCors(req, NextResponse.json(counts, { status: 200 }));
     }
 
     // =========================================================================
-    // 9. QR PAYMENT TRANSACTIONS & PRODUCT BOOSTING (New Feature Support)
+    // 9. QR PAYMENT TRANSACTIONS & PRODUCT BOOSTING
     // =========================================================================
     if (method === "GET" && routePath === "/transactions") {
       if (!session) return errorResponse(req, "Authentication required.", 401);
-      const q = query(
-        collection(db, "transactions"),
-        where("userEmail", "==", session.email.toLowerCase())
-      );
-      const snap = await getDocs(q);
+      const snap = await adminDb
+        .collection("transactions")
+        .where("userEmail", "==", session.email.toLowerCase())
+        .get();
       const txList = snap.docs.map((d) => ({ ...(d.data() as BoostTransaction), id: d.id }));
       return withCors(req, NextResponse.json(txList, { status: 200 }));
     }
@@ -1386,12 +1484,12 @@ async function handleRequest(
       }
 
       const txId = crypto.randomUUID();
-      const listingRef = doc(db, "listings", listingId);
-      const txRef = doc(db, "transactions", txId);
+      const listingRef = adminDb.collection("listings").doc(listingId);
+      const txRef = adminDb.collection("transactions").doc(txId);
 
-      const boostRecord = await runTransaction(db, async (tx) => {
+      const boostRecord = await adminDb.runTransaction(async (tx) => {
         const lSnap = await tx.get(listingRef);
-        if (!lSnap.exists()) throw new Error("NOT_FOUND");
+        if (!lSnap.exists) throw new Error("NOT_FOUND");
         const listing = lSnap.data() as StoredListing;
         if (listing.owner_email.toLowerCase() !== session.email.toLowerCase()) {
           throw new Error("FORBIDDEN");
@@ -1417,14 +1515,14 @@ async function handleRequest(
       return withCors(req, NextResponse.json(boostRecord, { status: 201 }));
     }
 
-    // Keep deleteDoc referenced for clean TypeScript builds
-    void deleteDoc;
-
     return errorResponse(req, `Endpoint ${method} ${routePath} not found`, 404);
   } catch (err: unknown) {
     const code = err instanceof Error ? err.message : "INTERNAL_ERROR";
     if (code === "NOT_FOUND") return errorResponse(req, "Requested resource not found.", 404);
     if (code === "FORBIDDEN") return errorResponse(req, "Forbidden operation.", 403);
+    if (code === "FORBIDDEN_BUYER_ONLY") {
+      return errorResponse(req, "Only the authenticated buyer can confirm item receipt.", 403);
+    }
     if (code === "SELF_REQUEST") {
       return errorResponse(req, "You cannot request your own listing.", 403);
     }
@@ -1433,6 +1531,9 @@ async function handleRequest(
     }
     if (code === "DUPLICATE_REQUEST") {
       return errorResponse(req, "You already have an active request for this listing.", 409);
+    }
+    if (code === "ALREADY_COMPLETED") {
+      return errorResponse(req, "This request has already been completed.", 409);
     }
     if (
       code === "CONFLICT" ||
