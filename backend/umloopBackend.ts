@@ -253,3 +253,41 @@ export async function completeItemHandover(requestId: string, listingId: string)
   await updateDoc(doc(db, "requests", requestId), { request_status: "Completed" });
   await updateDoc(doc(db, "listings", listingId), { status: "Completed" });
 }
+// Confirm item receipt via server-side Firebase Admin SDK transaction (updates status & increments statistics/global.reuseCount)
+export async function confirmReceiptViaServer(requestId: string) {
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error("Please sign in with your @siswa.um.edu.my account first.");
+  }
+
+  const idToken = await currentUser.getIdToken();
+  const response = await fetch(
+    `/api/requests/${encodeURIComponent(requestId)}/confirm-receipt`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${idToken}`,
+      },
+    }
+  );
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.message || "Failed to confirm receipt on server.");
+  }
+
+  return payload;
+}
+
+// Subscribe directly to statistics/global.reuseCount (avoids full-collection reads on Firestore free tier)
+export function subscribeToGlobalReuseCount(onCountChange: (count: number) => void) {
+  const statsRef = doc(db, "statistics", "global");
+  return onSnapshot(statsRef, (snapshot) => {
+    if (snapshot.exists()) {
+      onCountChange(Number(snapshot.data().reuseCount ?? 0));
+    } else {
+      onCountChange(0);
+    }
+  });
+}
